@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 import numpy as np
 import pandas as pd
@@ -10,7 +10,23 @@ import math
 import time
 from datetime import datetime, timedelta
 import json
-from flask import render_template
+
+# ─── InfluxDB Cloud ───────────────────────────────────────────────────────────
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+INFLUX_URL    = "https://us-east-1-1.aws.cloud2.influxdata.com"
+INFLUX_TOKEN  = "DOQh0iFuheDgbXW-soydu8jRuqCmHR58Zkar3EsSGUre3mUSPJ6YrgNgnHw4bQWyxsVAJ4iGUVhg2ANUBbAhoA==" # token API
+INFLUX_ORG    = "893556800524739c"
+INFLUX_BUCKET = "water_quality"
+
+influx_client = InfluxDBClient(
+    url=INFLUX_URL,
+    token=INFLUX_TOKEN,
+    org=INFLUX_ORG
+)
+write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+query_api = influx_client.query_api()
 
 app = Flask(__name__)
 CORS(app)
@@ -75,7 +91,6 @@ def calculate_wqi(data):
         lo, hi = standards["min"], standards["max"]
         weight = standards["weight"]
 
-        # Sub-index: distance from ideal, normalized 0-100
         if val <= ideal:
             sub = 100 * (val - lo) / max(ideal - lo, 1e-9) if (ideal - lo) > 0 else 100
         else:
@@ -165,6 +180,34 @@ def add_to_history(reading, wqi_info):
         HISTORY.pop(0)
 
 # ─────────────────────────────────────────────
+#  INFLUXDB WRITE
+# ─────────────────────────────────────────────
+import threading
+
+def write_to_influx(reading: dict, wqi_info: dict, pollution: dict):
+    point = (
+        Point("water_quality")
+        .tag("source", "simulator")
+        .field("temperature",       float(reading["temperature"]))
+        .field("ph",                float(reading["ph"]))
+        .field("turbidity",         float(reading["turbidity"]))
+        .field("conductivity",      float(reading["conductivity"]))
+        .field("dissolved_o2",      float(reading["dissolved_o2"]))
+        .field("so2",               float(reading["so2"]))
+        .field("wqi",               float(wqi_info["wqi"]))
+        .field("pollution_rf",      float(pollution["random_forest"]))
+        .field("pollution_lr",      float(pollution["linear_regression"]))
+        .field("pollution_average", float(pollution["average"]))
+        .time(reading["timestamp"], WritePrecision.S)
+    )
+    def _write():
+        try:
+            write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+        except Exception as e:
+            print(f"⚠  InfluxDB write error: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
+# ─────────────────────────────────────────────
 #  ALERT ENGINE
 # ─────────────────────────────────────────────
 THRESHOLDS = {
@@ -207,14 +250,12 @@ def generate_alerts(reading, save_to_history=False):
             })
 
     if save_to_history:
-        # Mark resolved: params that were in last alert cycle but are now clean
         current_params = {a["param"] for a in alerts}
         if ALERT_HISTORY:
             for past in reversed(ALERT_HISTORY):
                 if not past["resolved"] and past["param"] not in current_params:
                     past["resolved"] = True
                     past["resolved_at"] = now.isoformat()
-        # Append new alerts to history
         for alert in alerts:
             ALERT_HISTORY.append(dict(alert))
         if len(ALERT_HISTORY) > ALERT_HISTORY_LIMIT:
@@ -231,28 +272,34 @@ def home():
     return render_template("index.html")
 
 
-
 @app.route("/data")
 def get_data():
-    reading = simulator.next()
+    reading  = simulator.next()
     wqi_info = calculate_wqi(reading)
     add_to_history(reading, wqi_info)
 
-    features_array = np.array([[reading[f] for f in FEATURES]])
-    features_scaled = scaler.transform(features_array)
+    features_df     = pd.DataFrame([[reading[f] for f in FEATURES]], columns=FEATURES)
+    features_scaled = scaler.transform(features_df)
     pollution_rf = float(np.clip(rf_model.predict(features_scaled)[0], 0, 100))
     pollution_lr = float(np.clip(lr_model.predict(features_scaled)[0], 0, 100))
 
+    pollution = {
+        "random_forest":     round(pollution_rf, 2),
+        "linear_regression": round(pollution_lr, 2),
+        "average":           round((pollution_rf + pollution_lr) / 2, 2)
+    }
+
+    # ── Persistance InfluxDB Cloud ────────────────────────────────────
+    write_to_influx(reading, wqi_info, pollution)
+    # ─────────────────────────────────────────────────────────────────
+
     return jsonify({
-        "sensors": reading,
-        "wqi": wqi_info,
-        "pollution": {
-            "random_forest": round(pollution_rf, 2),
-            "linear_regression": round(pollution_lr, 2),
-            "average": round((pollution_rf + pollution_lr) / 2, 2)
-        },
-        "alerts": generate_alerts(reading, save_to_history=True)
+        "sensors":   reading,
+        "wqi":       wqi_info,
+        "pollution": pollution,
+        "alerts":    generate_alerts(reading, save_to_history=True)
     })
+
 
 @app.route("/predict")
 def get_prediction():
@@ -260,61 +307,62 @@ def get_prediction():
         return jsonify({"error": "Not enough history yet", "predictions": []})
 
     recent = HISTORY[-10:]
-    last = recent[-1]
+    last   = recent[-1]
 
     predictions = []
     prev = {f: last[f] for f in FEATURES}
 
     for i in range(1, 6):
-        noise = {f: random.gauss(0, 0.05 * abs(prev[f]) + 0.1) for f in FEATURES}
+        noise     = {f: random.gauss(0, 0.05 * abs(prev[f]) + 0.1) for f in FEATURES}
         next_vals = {f: prev[f] + noise[f] for f in FEATURES}
-        next_vals["ph"] = np.clip(next_vals["ph"], 4.0, 10.0)
-        next_vals["dissolved_o2"] = np.clip(next_vals["dissolved_o2"], 0, 14)
-        next_vals["turbidity"] = max(0, next_vals["turbidity"])
+        next_vals["ph"]          = np.clip(next_vals["ph"], 4.0, 10.0)
+        next_vals["dissolved_o2"]= np.clip(next_vals["dissolved_o2"], 0, 14)
+        next_vals["turbidity"]   = max(0, next_vals["turbidity"])
 
         arr_scaled = scaler.transform([[next_vals[f] for f in FEATURES]])
-        poll_rf = float(np.clip(rf_model.predict(arr_scaled)[0], 0, 100))
-        wqi_p = calculate_wqi(next_vals)
+        poll_rf    = float(np.clip(rf_model.predict(arr_scaled)[0], 0, 100))
+        wqi_p      = calculate_wqi(next_vals)
 
         ts = datetime.now() + timedelta(seconds=i * 3)
         predictions.append({
-            "step": i,
-            "timestamp": ts.isoformat(),
-            "values": {k: round(v, 3) for k, v in next_vals.items()},
-            "pollution_pct": round(poll_rf, 2),
-            "wqi": wqi_p["wqi"],
+            "step":           i,
+            "timestamp":      ts.isoformat(),
+            "values":         {k: round(v, 3) for k, v in next_vals.items()},
+            "pollution_pct":  round(poll_rf, 2),
+            "wqi":            wqi_p["wqi"],
             "classification": wqi_p["classification"],
-            "color": wqi_p["color"]
+            "color":          wqi_p["color"]
         })
         prev = next_vals
 
-    # Feature importance
     importances = dict(zip(FEATURES, rf_model.feature_importances_.tolist()))
 
     return jsonify({
-        "predictions": predictions,
+        "predictions":        predictions,
         "feature_importance": {k: round(v * 100, 1) for k, v in importances.items()},
-        "model": "Random Forest",
-        "history_size": len(HISTORY)
+        "model":              "Random Forest",
+        "history_size":       len(HISTORY)
     })
+
 
 @app.route("/alerts")
 def get_alerts():
     if not HISTORY:
         return jsonify({"alerts": [], "count": 0})
-    last = HISTORY[-1]
+    last   = HISTORY[-1]
     alerts = generate_alerts(last)
     return jsonify({"alerts": alerts, "count": len(alerts),
                     "timestamp": datetime.now().isoformat()})
 
+
 @app.route("/alerts/history")
 def get_alert_history():
-    limit  = int(request.args.get("limit", 100))
-    offset = int(request.args.get("offset", 0))
-    severity_filter = request.args.get("severity")   # WARNING | CRITICAL
+    limit           = int(request.args.get("limit", 100))
+    offset          = int(request.args.get("offset", 0))
+    severity_filter = request.args.get("severity")
     param_filter    = request.args.get("param")
 
-    result = list(reversed(ALERT_HISTORY))           # newest first
+    result = list(reversed(ALERT_HISTORY))
     if severity_filter:
         result = [a for a in result if a["severity"] == severity_filter]
     if param_filter:
@@ -323,23 +371,74 @@ def get_alert_history():
     total = len(result)
     page  = result[offset: offset + limit]
     return jsonify({
-        "history": page,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
+        "history":  page,
+        "total":    total,
+        "limit":    limit,
+        "offset":   offset,
         "has_more": (offset + limit) < total
     })
+
 
 @app.route("/history")
 def get_history():
     limit = int(request.args.get("limit", 50))
     return jsonify({"history": HISTORY[-limit:], "total": len(HISTORY)})
 
+
+@app.route("/history/influx")
+def get_influx_history():
+    """
+    Interroge InfluxDB Cloud et retourne l'historique des capteurs.
+
+    Paramètres (query string) :
+      - range  : fenêtre temporelle Flux  (ex: 1h, 6h, 24h, 7d)  — défaut: 1h
+      - field  : un capteur précis        (ex: ph, temperature)   — défaut: tous
+
+    Réponse :
+      { data: [ { timestamp, temperature, ph, turbidity, … }, … ], count, range }
+    """
+    range_val = request.args.get("range", "1h")
+    field     = request.args.get("field")
+
+    filter_clause = (
+        f'|> filter(fn: (r) => r._field == "{field}")'
+        if field else ""
+    )
+
+    flux_query = f"""
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: -{range_val})
+      |> filter(fn: (r) => r._measurement == "water_quality")
+      {filter_clause}
+      |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> sort(columns: ["_time"])
+    """
+
+    try:
+        tables = query_api.query(flux_query, org=INFLUX_ORG)
+        rows   = []
+        sensor_fields = [
+            "temperature", "ph", "turbidity", "conductivity",
+            "dissolved_o2", "so2", "wqi",
+            "pollution_rf", "pollution_lr", "pollution_average"
+        ]
+        for table in tables:
+            for record in table.records:
+                row = {"timestamp": record.get_time().isoformat()}
+                for key in sensor_fields:
+                    if record.values.get(key) is not None:
+                        row[key] = round(float(record.values[key]), 4)
+                rows.append(row)
+        return jsonify({"data": rows, "count": len(rows), "range": range_val})
+    except Exception as e:
+        return jsonify({"error": str(e), "data": []}), 500
+
+
 @app.route("/stats")
 def get_stats():
     if not HISTORY:
         return jsonify({})
-    df = pd.DataFrame(HISTORY)
+    df    = pd.DataFrame(HISTORY)
     stats = {}
     for col in FEATURES + ["wqi"]:
         if col in df:
@@ -350,6 +449,7 @@ def get_stats():
                 "std":  round(float(df[col].std()), 3)
             }
     return jsonify(stats)
+
 
 if __name__ == "__main__":
     app.run(debug=False, port=5050, host="0.0.0.0")
